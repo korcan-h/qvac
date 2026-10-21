@@ -29,18 +29,19 @@ jobs:
         include:
           # Expected to crash, as the SDK e2e test does.
           - name: baseline
-            rounds: 3
+            rounds: 8
           # Control: expected to pass.
           - name: graphs-off
-            rounds: 3
+            rounds: 8
             disable_graphs: "1"
-          # Names the failing CUDA API call (with a host backtrace).
+          # Names the failing CUDA API call (with a host backtrace). Also lists API calls that
+          # failed and were swallowed, e.g. inside cuBLAS, even if the run doesn't crash.
           - name: memcheck
-            rounds: 1
+            rounds: 3
             sanitizer: memcheck
           # cuBLAS is the only CUDA runtime library loaded from the runner (cudart is static).
           - name: cublas-13.8
-            rounds: 3
+            rounds: 8
             cublas: "1"
     defaults:
       run:
@@ -76,7 +77,8 @@ jobs:
           if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne '0974318E9861A61CB9091CF7DE8D4C2880E9787FE311CB4BCBD08865663C5F43') { throw 'cuBLAS sha256 mismatch' }
           $dir = Join-Path $env:RUNNER_TEMP 'cublas'
           New-Item -ItemType Directory -Force $dir | Out-Null
-          tar -xf $zip -C $dir
+          & "$env:SystemRoot\System32\tar.exe" -xf $zip -C $dir   # not Git's GNU tar, which reads C: as a host
+          if ($LASTEXITCODE) { throw "tar failed: $LASTEXITCODE" }
           Add-Content $env:GITHUB_PATH (Join-Path $dir 'libcublas-windows-x86_64-13.8.0.4-archive\bin\x64')
 
       - name: Fetch compute-sanitizer 13.0.85 (CUDA 13.0.3)
@@ -89,7 +91,8 @@ jobs:
           if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne 'DCCA7CE173165D75EB7F5DF76672EC598B11F12E583356EAF80B16F6D43ACE9F') { throw 'compute-sanitizer sha256 mismatch' }
           $dir = Join-Path $env:RUNNER_TEMP 'sanitizer'
           New-Item -ItemType Directory -Force $dir | Out-Null
-          tar -xf $zip -C $dir
+          & "$env:SystemRoot\System32\tar.exe" -xf $zip -C $dir   # not Git's GNU tar, which reads C: as a host
+          if ($LASTEXITCODE) { throw "tar failed: $LASTEXITCODE" }
           Add-Content $env:GITHUB_ENV ('SANITIZER=' + (Join-Path $dir 'cuda_sanitizer_api-windows-x86_64-13.0.85-archive\compute-sanitizer\compute-sanitizer.exe'))
 
       - name: Runner info
@@ -99,6 +102,8 @@ jobs:
           # Only the queried fields: plain nvidia-smi would also list other jobs' GPU processes in a public log.
           nvidia-smi --query-gpu=name,driver_version,driver_model.current,driver_model.pending,memory.used,memory.total --format=csv
           "CUDA_PATH=$env:CUDA_PATH"
+          Get-ChildItem 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA' -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object { "installed toolkit: $($_.Name)" }
           foreach ($name in 'cublas64_13.dll', 'cublasLt64_13.dll') {
             foreach ($dll in (where.exe $name 2>$null)) { "{0}  {1}" -f $dll, (Get-Item $dll).VersionInfo.FileVersion }
           }
