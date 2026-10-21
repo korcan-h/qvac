@@ -1,0 +1,142 @@
+# TEMP DIAGNOSTIC (debug/cuda-capture-ci, do not merge): the Windows finetune crash
+# "MUL_MAT failed: CUDA error: out of memory" on the first CUDA graph capture.
+#
+# Runs tmp-cuda-capture-repro/repro.mjs (the SDK e2e finetune-start-complete and
+# finetune-pause-resume flows against the published @qvac/sdk 0.22.0 prebuilts, i.e. fabric
+# v11018.2.0) on the Windows GPU runners, one experiment per matrix job, in parallel.
+# A crash right after "CUDA graph warmup complete" is the bug; a job without that line
+# never captured a graph and tested nothing.
+name: TMP CUDA capture repro (do not merge)
+
+on:
+  push:
+    branches: [debug/cuda-capture-ci]
+    paths:
+      - .github/workflows/tmp-cuda-capture-repro.yml
+      - tmp-cuda-capture-repro/**
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    name: ${{ matrix.name }}
+    runs-on: qvac-win25-x64-gpu
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Expected to crash, as the SDK e2e test does.
+          - name: baseline
+            rounds: 3
+          # Control: expected to pass.
+          - name: graphs-off
+            rounds: 3
+            disable_graphs: "1"
+          # Names the failing CUDA API call (with a host backtrace).
+          - name: memcheck
+            rounds: 1
+            sanitizer: memcheck
+          # cuBLAS is the only CUDA runtime library loaded from the runner (cudart is static).
+          - name: cublas-13.8
+            rounds: 3
+            cublas: "1"
+    defaults:
+      run:
+        shell: powershell
+        working-directory: tmp-cuda-capture-repro
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # 6.0.2
+        with:
+          sparse-checkout: tmp-cuda-capture-repro
+          persist-credentials: false
+
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # 6.3.0
+        with:
+          node-version: 22
+
+      - name: Install the SDK prebuilts
+        env:
+          # Keep npm's cache in the job's temp dir instead of the runner account's profile.
+          npm_config_cache: ${{ runner.temp }}\npm-cache
+        run: |
+          npm install --no-audit --no-fund
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm ls @qvac/sdk @qvac/llm-llamacpp @qvac/fabric
+          $global:LASTEXITCODE = 0
+
+      - name: Fetch cuBLAS 13.8.0.4 (CUDA 13.4.2)
+        if: matrix.cublas == '1'
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $zip = Join-Path $env:RUNNER_TEMP 'cublas.zip'
+          Invoke-WebRequest -UseBasicParsing -OutFile $zip `
+            'https://developer.download.nvidia.com/compute/cuda/redist/libcublas/windows-x86_64/libcublas-windows-x86_64-13.8.0.4-archive.zip'
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne '0974318E9861A61CB9091CF7DE8D4C2880E9787FE311CB4BCBD08865663C5F43') { throw 'cuBLAS sha256 mismatch' }
+          $dir = Join-Path $env:RUNNER_TEMP 'cublas'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          tar -xf $zip -C $dir
+          Add-Content $env:GITHUB_PATH (Join-Path $dir 'libcublas-windows-x86_64-13.8.0.4-archive\bin\x64')
+
+      - name: Fetch compute-sanitizer 13.0.85 (CUDA 13.0.3)
+        if: matrix.sanitizer != ''
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $zip = Join-Path $env:RUNNER_TEMP 'sanitizer.zip'
+          Invoke-WebRequest -UseBasicParsing -OutFile $zip `
+            'https://developer.download.nvidia.com/compute/cuda/redist/cuda_sanitizer_api/windows-x86_64/cuda_sanitizer_api-windows-x86_64-13.0.85-archive.zip'
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne 'DCCA7CE173165D75EB7F5DF76672EC598B11F12E583356EAF80B16F6D43ACE9F') { throw 'compute-sanitizer sha256 mismatch' }
+          $dir = Join-Path $env:RUNNER_TEMP 'sanitizer'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          tar -xf $zip -C $dir
+          Add-Content $env:GITHUB_ENV ('SANITIZER=' + (Join-Path $dir 'cuda_sanitizer_api-windows-x86_64-13.0.85-archive\compute-sanitizer\compute-sanitizer.exe'))
+
+      - name: Runner info
+        continue-on-error: true
+        run: |
+          "machine: $env:COMPUTERNAME  runner: $env:RUNNER_NAME"
+          # Only the queried fields: plain nvidia-smi would also list other jobs' GPU processes in a public log.
+          nvidia-smi --query-gpu=name,driver_version,driver_model.current,driver_model.pending,memory.used,memory.total --format=csv
+          "CUDA_PATH=$env:CUDA_PATH"
+          foreach ($name in 'cublas64_13.dll', 'cublasLt64_13.dll') {
+            foreach ($dll in (where.exe $name 2>$null)) { "{0}  {1}" -f $dll, (Get-Item $dll).VersionInfo.FileVersion }
+          }
+          "nvcuda.dll  " + (Get-Item "$env:SystemRoot\System32\nvcuda.dll").VersionInfo.FileVersion
+          $global:LASTEXITCODE = 0
+
+      - name: Run the finetune repro
+        run: |
+          # Everything the SDK, the worker and the sanitizer write (model cache, ~/.qvac registry
+          # store, temp files) goes under RUNNER_TEMP, which the runner empties after the job.
+          $home_ = Join-Path $env:RUNNER_TEMP 'home'
+          $tmp = Join-Path $env:RUNNER_TEMP 'tmp'
+          New-Item -ItemType Directory -Force $home_, $tmp | Out-Null
+          $env:USERPROFILE = $home_; $env:HOME = $home_
+          $env:TEMP = $tmp; $env:TMP = $tmp
+          # Debug native logs show the graph warmup lines.
+          @{ loggerLevel = 'debug'; loggerConsoleOutput = $true; cacheDirectory = (Join-Path $env:RUNNER_TEMP 'qvac-cache') } |
+            ConvertTo-Json | Set-Content -Encoding ascii qvac.config.json
+          # Set only when wanted: ggml disables graphs if the variable exists at all.
+          if ('${{ matrix.disable_graphs }}' -eq '1') { $env:GGML_CUDA_DISABLE_GRAPHS = '1' }
+          $node = (Get-Command node).Source
+          if ($env:SANITIZER) {
+            & $env:SANITIZER --tool ${{ matrix.sanitizer }} --report-api-errors all --target-processes all `
+              --show-backtrace host --print-limit 200 $node repro.mjs registry ${{ matrix.rounds }}
+          } else {
+            & $node repro.mjs registry ${{ matrix.rounds }}
+          }
+          exit $LASTEXITCODE
+
+      # The runner also empties RUNNER_TEMP after the job; this covers the workspace and makes the
+      # cleanup visible in the log.
+      - name: Clean up
+        if: always()
+        continue-on-error: true
+        run: |
+          foreach ($dir in 'node_modules', (Join-Path $env:RUNNER_TEMP 'qvac-cache'), (Join-Path $env:RUNNER_TEMP 'home'),
+                           (Join-Path $env:RUNNER_TEMP 'tmp'), (Join-Path $env:RUNNER_TEMP 'npm-cache'),
+                           (Join-Path $env:RUNNER_TEMP 'cublas'), (Join-Path $env:RUNNER_TEMP 'sanitizer')) {
+            if (Test-Path $dir) { Remove-Item -Recurse -Force $dir -ErrorAction Continue; "removed $dir" }
+          }
+          Remove-Item -Force (Join-Path $env:RUNNER_TEMP '*.zip') -ErrorAction SilentlyContinue

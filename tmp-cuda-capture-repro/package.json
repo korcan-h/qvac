@@ -1,0 +1,16 @@
+{
+  "name": "qvac-finetune-repro",
+  "private": true,
+  "type": "module",
+  "description": "Runs the SDK e2e finetune tests standalone against the published prebuilt binaries CI used",
+  "scripts": {
+    "repro": "node repro.mjs"
+  },
+  "dependencies": {
+    "@qvac/sdk": "0.22.0"
+  },
+  "overrides": {
+    "@qvac/llm-llamacpp": "0.61.2",
+    "@qvac/fabric": "0.22.0"
+  }
+}
