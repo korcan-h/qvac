@@ -27,22 +27,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Expected to crash, as the SDK e2e test does.
+          # Reproduced the crash in run 2 (about 1 capture per 8-11 tests). Every job also logs the
+          # driver's own error messages (CUDA_LOG_FILE).
           - name: baseline
-            rounds: 8
-          # Control: expected to pass.
-          - name: graphs-off
-            rounds: 8
-            disable_graphs: "1"
-          # Names the failing CUDA API call (with a host backtrace). Also lists API calls that
-          # failed and were swallowed, e.g. inside cuBLAS, even if the run doesn't crash.
+            rounds: 20
+          # Names the failing CUDA API call. Side effect: the sanitizer's own address-space use makes
+          # ggml's 32 GiB VMM reservation fail, so this runs on the legacy cudaMalloc pool. A capture
+          # without a crash here would point at the VMM pool.
           - name: memcheck
-            rounds: 3
+            rounds: 30
             sanitizer: memcheck
-          # cuBLAS is the only CUDA runtime library loaded from the runner (cudart is static).
-          - name: cublas-13.8
-            rounds: 8
-            cublas: "1"
+          # Run 2 answered these: graphs-off passes; cuBLAS 13.8.0.4 still crashes.
+          # - name: graphs-off
+          #   rounds: 8
+          #   disable_graphs: "1"
+          # - name: cublas-13.8
+          #   rounds: 8
+          #   cublas: "1"
     defaults:
       run:
         shell: powershell
@@ -124,6 +125,8 @@ jobs:
             ConvertTo-Json | Set-Content -Encoding ascii qvac.config.json
           # Set only when wanted: ggml disables graphs if the variable exists at all.
           if ('${{ matrix.disable_graphs }}' -eq '1') { $env:GGML_CUDA_DISABLE_GRAPHS = '1' }
+          # The driver writes a plain-English reason for each failed CUDA API call here (R575+ drivers).
+          $env:CUDA_LOG_FILE = Join-Path $env:RUNNER_TEMP 'cuda-driver.log'
           $node = (Get-Command node).Source
           if ($env:SANITIZER) {
             & $env:SANITIZER --tool ${{ matrix.sanitizer }} --report-api-errors all --target-processes all `
@@ -131,7 +134,14 @@ jobs:
           } else {
             & $node repro.mjs registry ${{ matrix.rounds }}
           }
-          exit $LASTEXITCODE
+          $code = $LASTEXITCODE
+          if (Test-Path $env:CUDA_LOG_FILE) {
+            '--- CUDA driver error log ---'
+            Get-Content $env:CUDA_LOG_FILE
+          } else {
+            '--- no CUDA driver error log was written ---'
+          }
+          exit $code
 
       # The runner also empties RUNNER_TEMP after the job; this covers the workspace and makes the
       # cleanup visible in the log.
