@@ -25,7 +25,10 @@ permissions:
 jobs:
   build-module:
     name: build ${{ matrix.variant }}
-    runs-on: windows-2025
+    # windows-2022, not windows-2025: CUDA 13.0 needs a VS 2022 toolset (< 14.50), which the
+    # GitHub-hosted windows-2025 image doesn't ship (the repo's own CUDA builds use the self-hosted
+    # qvac-win25-x64, which we leave alone).
+    runs-on: windows-2022
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -89,6 +92,8 @@ jobs:
         run: |
           # A VS 2022 (14.4x) toolset, as setup-cuda selects: CUDA 13.0 rejects 14.50+.
           $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          & $vswhere -all -products * -format json | ConvertFrom-Json |
+            ForEach-Object { "found: $($_.displayName) $($_.installationVersion) at $($_.installationPath)" }
           $vs = & $vswhere -all -products * -version '[17.0,18.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1
           if (-not $vs) { throw 'no Visual Studio 2022 with the C++ x64 tools found' }
           $toolset = Get-ChildItem (Join-Path $vs 'VC\Tools\MSVC') -Directory |
@@ -152,6 +157,12 @@ jobs:
           sparse-checkout: tmp-cuda-capture-repro
           persist-credentials: false
 
+      # First, so a variant whose build failed stops here in seconds, before npm install.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # 8.0.1
+        with:
+          name: qvac-ggml-cuda-${{ matrix.variant }}
+          path: ${{ runner.temp }}\module
+
       - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # 6.3.0
         with:
           node-version: 22
@@ -165,11 +176,6 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           npm ls @qvac/sdk @qvac/llm-llamacpp @qvac/fabric
           $global:LASTEXITCODE = 0
-
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # 8.0.1
-        with:
-          name: qvac-ggml-cuda-${{ matrix.variant }}
-          path: ${{ runner.temp }}\module
 
       - name: Swap in the built qvac-ggml-cuda.dll
         run: |
