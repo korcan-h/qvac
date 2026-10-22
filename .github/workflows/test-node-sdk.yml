@@ -299,7 +299,10 @@ jobs:
           echo "built in this run:"
           find "$RUNNER_TEMP/fabric-prebuilds" -name 'qvac-ggml-cuda.dll' -exec sha256sum {} \;
           echo "installed for the tests:"
-          found=$(find node_modules -path '*@qvac/fabric*' -name 'qvac-ggml-cuda.dll' 2>/dev/null)
+          # The overlay nests the platform package under @qvac/fabric as a link, which find only follows with -L.
+          found=$( { find node_modules -path '*@qvac/fabric*' -name 'qvac-ggml-cuda.dll'
+                     find -L node_modules/@qvac/fabric/node_modules -name 'qvac-ggml-cuda.dll'
+                   } 2>/dev/null | sort -u || true)
           if [ -z "$found" ]; then
             echo "::error::no qvac-ggml-cuda.dll under node_modules/@qvac/fabric"
             exit 1
@@ -413,14 +416,19 @@ jobs:
 
       # TEMP (tmp-cuda-win-fix-022): leave nothing behind on the self-hosted runner: the downloaded
       # fabric prebuilds in RUNNER_TEMP and the workspace (node_modules with the overlay, and the
-      # SDK cache dir .qvac-cache with the models and the registry store).
+      # SDK cache dir .qvac-cache with the models and the registry store). .sdk-e2e-workflow stays:
+      # "Install and build" is a composite action from it whose post step runs after this one, and
+      # the next job's "Manual Workspace Cleanup" removes it.
       - name: Clean up the test runner
         if: always() && inputs.fabric-overlay-artifact != '' && runner.environment != 'github-hosted'
         shell: bash
         run: |
           rm -rf "$RUNNER_TEMP/fabric-prebuilds"
-          rm -rf "$GITHUB_WORKSPACE" && mkdir -p "$GITHUB_WORKSPACE"
-          echo "removed RUNNER_TEMP/fabric-prebuilds and the workspace"
+          shopt -s dotglob nullglob
+          for p in "${GITHUB_WORKSPACE:?}"/*; do
+            [ "${p##*/}" = .sdk-e2e-workflow ] || rm -rf "$p"
+          done
+          echo "removed RUNNER_TEMP/fabric-prebuilds and the workspace except .sdk-e2e-workflow"
 
   report-finalize:
     name: "[${{ inputs.consumer }}] report-finalize"
