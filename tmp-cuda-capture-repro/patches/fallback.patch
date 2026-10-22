@@ -1,0 +1,60 @@
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 29a435e..963e3d8 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1484,6 +1484,7 @@ struct ggml_cuda_graph {
+     size_t num_nodes = 0;
+     std::vector<cudaGraphNode_t> nodes;
+     bool disable_due_to_gpu_arch = false;
++    bool disable_due_to_failed_capture = false; // TEMP (debug/cuda-capture-ci)
+     bool warmup_complete = false;
+     uint64_t uid = 0;
+     int64_t last_used_time = 0;
+@@ -1499,7 +1500,7 @@ struct ggml_cuda_graph {
+ 
+     bool is_enabled() const {
+         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
+-        return !(disable_due_to_gpu_arch || disable_cuda_graphs_due_to_env);
++        return !(disable_due_to_gpu_arch || disable_due_to_failed_capture || disable_cuda_graphs_due_to_env);
+     }
+ #endif
+ };
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 9842531..a88c25b 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3186,6 +3186,14 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context &          ctx,
+     cudaError_t err = cudaGetLastError();
+     if (err != cudaSuccess) {
+         GGML_LOG_ERROR("%s: %s failed\n", __func__, ggml_op_desc(dst));
++        // TEMP (debug/cuda-capture-ci): during CUDA graph capture, fail the op instead of aborting;
++        // ggml_backend_cuda_graph_compute then reruns the graph without CUDA graphs.
++        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
++        if (cudaStreamIsCapturing(ctx.stream(), &capture_status) == cudaSuccess &&
++            capture_status != cudaStreamCaptureStatusNone) {
++            GGML_LOG_WARN("%s: %s during CUDA graph capture\n", __func__, cudaGetErrorString(err));
++            return false;
++        }
+         CUDA_CHECK(err);
+     }
+ 
+@@ -5976,10 +5984,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+             }
+             graph->discard_pending_workspace();
+             (void) cudaGetLastError();
+-            std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+-            if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
+-                ggml_cuda_lock_cv.notify_all();
++            {
++                std::lock_guard<std::mutex> lock(ggml_cuda_lock);
++                if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
++                    ggml_cuda_lock_cv.notify_all();
++                }
+             }
++            // TEMP (debug/cuda-capture-ci): run this graph without CUDA graphs from now on.
++            graph->disable_due_to_failed_capture = true;
++            GGML_LOG_WARN("%s: CUDA graph capture failed, running this graph without CUDA graphs\n", __func__);
++            return ggml_backend_cuda_graph_compute(backend, cgraph);
+         }
+ #endif
+         return GGML_STATUS_FAILED;

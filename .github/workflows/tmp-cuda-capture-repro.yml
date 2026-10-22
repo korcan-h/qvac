@@ -1,11 +1,15 @@
 # TEMP DIAGNOSTIC (debug/cuda-capture-ci, do not merge): the Windows finetune crash
-# "MUL_MAT failed: CUDA error: out of memory" on the first CUDA graph capture.
+# "MUL_MAT failed: CUDA error: out of memory" on CUDA graph capture.
 #
-# Runs tmp-cuda-capture-repro/repro.mjs (the SDK e2e finetune-start-complete and
-# finetune-pause-resume flows against the published @qvac/sdk 0.22.0 prebuilts, i.e. fabric
-# v11018.2.0) on the Windows GPU runners, one experiment per matrix job, in parallel.
-# A crash right after "CUDA graph warmup complete" is the bug; a job without that line
-# never captured a graph and tested nothing.
+# Findings so far: during capture of the training graph, cuBLAS allocates (cudaMallocAsync, i.e.
+# a graph memory node) on every LoRA-A matmul ([2048|6144 x 8] x [.. x 128]); on the Windows GPU
+# runners that cuMemAllocAsync fails with OUT_OF_MEMORY and ggml aborts.
+#
+# This workflow builds qvac-ggml-cuda.dll from fabric v11018.2.0 (the version in the published
+# @qvac/fabric-win32-x64 0.22.0) plus one patch per variant, on a GitHub-hosted runner, then swaps
+# it into the SDK install on qvac-win25-x64-gpu and runs tmp-cuda-capture-repro/repro.mjs.
+#
+# No secrets, read-only token, no Actions caches written, artifacts kept for 1 day.
 name: TMP CUDA capture repro (do not merge)
 
 on:
@@ -19,41 +23,125 @@ permissions:
   contents: read
 
 jobs:
+  build-module:
+    name: build ${{ matrix.variant }}
+    runs-on: windows-2025
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        # rebuilt: no patch (control, must still crash); the others: tmp-cuda-capture-repro/patches/<variant>.patch
+        variant: [rebuilt, diag, fallback, no-train-graphs]
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # 6.0.2
+        with:
+          sparse-checkout: tmp-cuda-capture-repro
+          persist-credentials: false
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # 6.0.2
+        with:
+          repository: tetherto/qvac-fabric-llm.cpp
+          ref: v11018.2.0
+          path: fabric
+          persist-credentials: false
+
+      - name: Apply the variant's patch
+        if: matrix.variant != 'rebuilt'
+        run: |
+          git -C fabric apply --verbose "$env:GITHUB_WORKSPACE/tmp-cuda-capture-repro/patches/${{ matrix.variant }}.patch"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      # Same pinned CUDA 13.0.3 components as .github/actions/setup-cuda (nvcc 13.0.88, as the vcpkg
+      # port). Downloaded here instead of using that action, because it saves the toolkit into the
+      # repo's Actions cache on push events.
+      - name: Fetch CUDA 13.0.3 (no cache)
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $cuda = Join-Path $env:RUNNER_TEMP 'cuda'
+          $components = @(
+            @('cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-13.0.88-archive.zip', '61760e24a44937c6c29a20ddea69067b4d3860ccd6a9a0564573f840d96e6c5f'),
+            @('libnvvm/windows-x86_64/libnvvm-windows-x86_64-13.0.88-archive.zip', '6dda4a82d22a2c173a65c66b4b4c933e3424a56ce845e2864bdca9cc66e6c524'),
+            @('cuda_crt/windows-x86_64/cuda_crt-windows-x86_64-13.0.88-archive.zip', 'ff413c89dbd96ed3b3dcfac923437de78acea32fb90309277197c8a127588112'),
+            @('cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-13.0.96-archive.zip', 'a2ed875f9997aa24904fb70cc9db3acd9308433cde99bc8e63ec1271c9da31b4'),
+            @('cuda_cccl/windows-x86_64/cuda_cccl-windows-x86_64-13.0.85-archive.zip', 'f4f5187f7976d8057d76e1e04e72c8b7d0a2a22793107a671ad709b1d8d3408d'),
+            @('libcublas/windows-x86_64/libcublas-windows-x86_64-13.1.1.3-archive.zip', 'd6dfb0f7ad09730bafa1fd948bc65472e28c8a6dc30b4a2b32191f2380f9282b')
+          )
+          New-Item -ItemType Directory -Force $cuda | Out-Null
+          foreach ($c in $components) {
+            $zip = Join-Path $env:RUNNER_TEMP (Split-Path $c[0] -Leaf)
+            Invoke-WebRequest -UseBasicParsing -OutFile $zip "https://developer.download.nvidia.com/compute/cuda/redist/$($c[0])"
+            if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne $c[1].ToUpper()) { throw "sha256 mismatch: $($c[0])" }
+            $tmp = Join-Path $env:RUNNER_TEMP 'cuda-extract'
+            Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Force $tmp | Out-Null
+            & "$env:SystemRoot\System32\tar.exe" -xf $zip -C $tmp   # not Git's GNU tar, which reads C: as a host
+            if ($LASTEXITCODE) { throw "tar failed: $($c[0])" }
+            $root = Get-ChildItem $tmp -Directory | Select-Object -First 1
+            Copy-Item -Recurse -Force (Join-Path $root.FullName '*') $cuda
+            Remove-Item -Recurse -Force $tmp, $zip
+          }
+          & (Join-Path $cuda 'bin\nvcc.exe') --version
+
+      - name: Build qvac-ggml-cuda.dll (sm_89)
+        run: |
+          # A VS 2022 (14.4x) toolset, as setup-cuda selects: CUDA 13.0 rejects 14.50+.
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -all -products * -version '[17.0,18.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1
+          if (-not $vs) { throw 'no Visual Studio 2022 with the C++ x64 tools found' }
+          $toolset = Get-ChildItem (Join-Path $vs 'VC\Tools\MSVC') -Directory |
+            Where-Object { $_.Name -match '^14\.(\d+)\.' -and [int]$Matches[1] -lt 50 } |
+            Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
+          if (-not $toolset) { throw 'no MSVC 14.x (< 14.50) toolset found' }
+          $ver = ([version]$toolset.Name)
+          "Visual Studio: $vs, MSVC toolset $($toolset.Name)"
+          cmd /s /c "`"$(Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat')`" -vcvars_ver=$($ver.Major).$($ver.Minor) >nul && set" |
+            ForEach-Object { if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($Matches[1])" -Value $Matches[2] } }
+
+          $cuda = Join-Path $env:RUNNER_TEMP 'cuda'
+          $env:CUDA_PATH = $cuda
+          $env:PATH = "$cuda\bin;$env:PATH"
+          # The port's CUDA options, built for sm_89 only. Static CRT: the published DLL imports no C runtime.
+          cmake -S fabric -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded `
+            -DBUILD_SHARED_LIBS=OFF -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=ON `
+            -DGGML_OPENMP=OFF -DGGML_VULKAN=OFF `
+            -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89-real "-DCMAKE_CUDA_COMPILER=$cuda\bin\nvcc.exe" `
+            "-DCUDAToolkit_ROOT=$cuda" -DGGML_CUDA_GRAPHS=ON -DGGML_CUDA_FA=ON `
+            "-DGGML_CUDA_FA_QUANTS=q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16" `
+            -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_CURL=OFF
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build build --target ggml-cuda
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $dll = Get-ChildItem build -Recurse -Filter 'qvac-ggml-cuda.dll' | Select-Object -First 1
+          if (-not $dll) { throw 'qvac-ggml-cuda.dll not found' }
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item $dll.FullName out\
+          dumpbin /dependents out\qvac-ggml-cuda.dll | Select-String '\.dll'
+          (Get-FileHash out\qvac-ggml-cuda.dll -Algorithm SHA256).Hash
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # 7.0.0
+        with:
+          name: qvac-ggml-cuda-${{ matrix.variant }}
+          path: out/qvac-ggml-cuda.dll
+          retention-days: 1
+          if-no-files-found: error
+
   repro:
-    name: ${{ matrix.name }}
+    name: test ${{ matrix.variant }}
+    needs: build-module
+    # Test the variants that did build even if another build failed (a missing artifact fails only that leg).
+    if: ${{ !cancelled() }}
     runs-on: qvac-win25-x64-gpu
     timeout-minutes: 60
     strategy:
       fail-fast: false
+      # At most two jobs on the shared GPU machines at a time.
+      max-parallel: 2
       matrix:
-        include:
-          # Run 3: the crash is cuMemAllocAsync failing during capture (graph memory nodes, ~7 per
-          # layer); under memcheck, where ggml's 32 GiB VMM reservation failed, captures didn't crash.
-          #
-          # Address-space test without the sanitizer: a second model (its own context and 32 GiB
-          # reservation) is loaded first. If the training context's reservation then fails
-          # ("failed to reserve the 32768 MiB VMM pool"), captures should not crash.
-          - name: second-model
-            rounds: 20
-            second_model: "1"
-          # Which cuBLAS call allocates during capture: cuBLAS / cuBLASLt API logs, tails printed.
-          - name: cublas-log
-            rounds: 20
-            cublas_log: "1"
-          # Run 3 answered these: baseline crashes with cuMemAllocAsync OUT_OF_MEMORY; memcheck
-          # (legacy pool) captured ~7 times without crashing.
-          # - name: baseline
-          #   rounds: 20
-          # - name: memcheck
-          #   rounds: 30
-          #   sanitizer: memcheck
-          # Run 2 answered these: graphs-off passes; cuBLAS 13.8.0.4 still crashes.
-          # - name: graphs-off
-          #   rounds: 8
-          #   disable_graphs: "1"
-          # - name: cublas-13.8
-          #   rounds: 8
-          #   cublas: "1"
+        variant: [rebuilt, diag, fallback, no-train-graphs]
     defaults:
       run:
         shell: powershell
@@ -78,88 +166,48 @@ jobs:
           npm ls @qvac/sdk @qvac/llm-llamacpp @qvac/fabric
           $global:LASTEXITCODE = 0
 
-      - name: Fetch cuBLAS 13.8.0.4 (CUDA 13.4.2)
-        if: matrix.cublas == '1'
-        run: |
-          $ProgressPreference = 'SilentlyContinue'
-          $zip = Join-Path $env:RUNNER_TEMP 'cublas.zip'
-          Invoke-WebRequest -UseBasicParsing -OutFile $zip `
-            'https://developer.download.nvidia.com/compute/cuda/redist/libcublas/windows-x86_64/libcublas-windows-x86_64-13.8.0.4-archive.zip'
-          if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne '0974318E9861A61CB9091CF7DE8D4C2880E9787FE311CB4BCBD08865663C5F43') { throw 'cuBLAS sha256 mismatch' }
-          $dir = Join-Path $env:RUNNER_TEMP 'cublas'
-          New-Item -ItemType Directory -Force $dir | Out-Null
-          & "$env:SystemRoot\System32\tar.exe" -xf $zip -C $dir   # not Git's GNU tar, which reads C: as a host
-          if ($LASTEXITCODE) { throw "tar failed: $LASTEXITCODE" }
-          Add-Content $env:GITHUB_PATH (Join-Path $dir 'libcublas-windows-x86_64-13.8.0.4-archive\bin\x64')
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # 8.0.1
+        with:
+          name: qvac-ggml-cuda-${{ matrix.variant }}
+          path: ${{ runner.temp }}\module
 
-      - name: Fetch compute-sanitizer 13.0.85 (CUDA 13.0.3)
-        if: matrix.sanitizer != ''
+      - name: Swap in the built qvac-ggml-cuda.dll
         run: |
-          $ProgressPreference = 'SilentlyContinue'
-          $zip = Join-Path $env:RUNNER_TEMP 'sanitizer.zip'
-          Invoke-WebRequest -UseBasicParsing -OutFile $zip `
-            'https://developer.download.nvidia.com/compute/cuda/redist/cuda_sanitizer_api/windows-x86_64/cuda_sanitizer_api-windows-x86_64-13.0.85-archive.zip'
-          if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne 'DCCA7CE173165D75EB7F5DF76672EC598B11F12E583356EAF80B16F6D43ACE9F') { throw 'compute-sanitizer sha256 mismatch' }
-          $dir = Join-Path $env:RUNNER_TEMP 'sanitizer'
-          New-Item -ItemType Directory -Force $dir | Out-Null
-          & "$env:SystemRoot\System32\tar.exe" -xf $zip -C $dir   # not Git's GNU tar, which reads C: as a host
-          if ($LASTEXITCODE) { throw "tar failed: $LASTEXITCODE" }
-          Add-Content $env:GITHUB_ENV ('SANITIZER=' + (Join-Path $dir 'cuda_sanitizer_api-windows-x86_64-13.0.85-archive\compute-sanitizer\compute-sanitizer.exe'))
+          $target = 'node_modules\@qvac\fabric-win32-x64\prebuilds\win32-x64\qvac__fabric-win32-x64\qvac-ggml-cuda.dll'
+          if (-not (Test-Path $target)) { throw "not found: $target" }
+          "prebuilt: " + (Get-FileHash $target -Algorithm SHA256).Hash
+          Copy-Item -Force (Join-Path $env:RUNNER_TEMP 'module\qvac-ggml-cuda.dll') $target
+          "swapped:  " + (Get-FileHash $target -Algorithm SHA256).Hash + "  (${{ matrix.variant }})"
 
       - name: Runner info
         continue-on-error: true
         run: |
           "machine: $env:COMPUTERNAME  runner: $env:RUNNER_NAME"
           # Only the queried fields: plain nvidia-smi would also list other jobs' GPU processes in a public log.
-          nvidia-smi --query-gpu=name,driver_version,driver_model.current,driver_model.pending,memory.used,memory.total --format=csv
-          "CUDA_PATH=$env:CUDA_PATH"
-          Get-ChildItem 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA' -Directory -ErrorAction SilentlyContinue |
-            ForEach-Object { "installed toolkit: $($_.Name)" }
-          foreach ($name in 'cublas64_13.dll', 'cublasLt64_13.dll') {
-            foreach ($dll in (where.exe $name 2>$null)) { "{0}  {1}" -f $dll, (Get-Item $dll).VersionInfo.FileVersion }
-          }
-          "nvcuda.dll  " + (Get-Item "$env:SystemRoot\System32\nvcuda.dll").VersionInfo.FileVersion
+          nvidia-smi --query-gpu=name,driver_version,driver_model.current,memory.used,memory.total --format=csv
           $global:LASTEXITCODE = 0
 
       - name: Run the finetune repro
         run: |
-          # Everything the SDK, the worker and the sanitizer write (model cache, ~/.qvac registry
-          # store, temp files) goes under RUNNER_TEMP, which the runner empties after the job.
+          # Everything the SDK and the worker write (model cache, ~/.qvac registry store, temp files)
+          # goes under RUNNER_TEMP, which the runner empties after the job.
           $home_ = Join-Path $env:RUNNER_TEMP 'home'
           $tmp = Join-Path $env:RUNNER_TEMP 'tmp'
           New-Item -ItemType Directory -Force $home_, $tmp | Out-Null
           $env:USERPROFILE = $home_; $env:HOME = $home_
           $env:TEMP = $tmp; $env:TMP = $tmp
-          # Debug native logs show the graph warmup lines.
+          # Debug native logs show the graph warmup lines and the [diag] lines.
           @{ loggerLevel = 'debug'; loggerConsoleOutput = $true; cacheDirectory = (Join-Path $env:RUNNER_TEMP 'qvac-cache') } |
             ConvertTo-Json | Set-Content -Encoding ascii qvac.config.json
-          # Set only when wanted: ggml disables graphs if the variable exists at all.
-          if ('${{ matrix.disable_graphs }}' -eq '1') { $env:GGML_CUDA_DISABLE_GRAPHS = '1' }
-          if ('${{ matrix.second_model }}' -eq '1') { $env:REPRO_SECOND_MODEL = '1' }
-          if ('${{ matrix.cublas_log }}' -eq '1') {
-            $env:CUBLAS_LOGINFO_DBG = '1'; $env:CUBLAS_LOGDEST_DBG = Join-Path $env:RUNNER_TEMP 'cublas.log'
-            $env:CUBLASLT_LOG_LEVEL = '5'; $env:CUBLASLT_LOG_FILE = Join-Path $env:RUNNER_TEMP 'cublaslt.log'
-          }
-          # The driver writes a plain-English reason for each failed CUDA API call here (R575+ drivers).
+          # The driver writes a plain-English reason for each failed CUDA API call here.
           $env:CUDA_LOG_FILE = Join-Path $env:RUNNER_TEMP 'cuda-driver.log'
-          $node = (Get-Command node).Source
-          if ($env:SANITIZER) {
-            & $env:SANITIZER --tool ${{ matrix.sanitizer }} --report-api-errors all --target-processes all `
-              --show-backtrace host --print-limit 200 $node repro.mjs registry ${{ matrix.rounds }}
-          } else {
-            & $node repro.mjs registry ${{ matrix.rounds }}
-          }
+          & (Get-Command node).Source repro.mjs registry 20
           $code = $LASTEXITCODE
           if (Test-Path $env:CUDA_LOG_FILE) {
-            '--- CUDA driver error log ---'
-            Get-Content $env:CUDA_LOG_FILE
+            '--- CUDA driver error log (first 60 lines) ---'
+            Get-Content $env:CUDA_LOG_FILE -TotalCount 60
           } else {
             '--- no CUDA driver error log was written ---'
-          }
-          # The calls just before a crash are at the end of the cuBLAS logs.
-          foreach ($log in 'cublas.log', 'cublaslt.log') {
-            $p = Join-Path $env:RUNNER_TEMP $log
-            if (Test-Path $p) { "--- last 200 lines of $log ($((Get-Item $p).Length) bytes) ---"; Get-Content $p -Tail 200 }
           }
           exit $code
 
@@ -171,7 +219,7 @@ jobs:
         run: |
           foreach ($dir in 'node_modules', (Join-Path $env:RUNNER_TEMP 'qvac-cache'), (Join-Path $env:RUNNER_TEMP 'home'),
                            (Join-Path $env:RUNNER_TEMP 'tmp'), (Join-Path $env:RUNNER_TEMP 'npm-cache'),
-                           (Join-Path $env:RUNNER_TEMP 'cublas'), (Join-Path $env:RUNNER_TEMP 'sanitizer')) {
+                           (Join-Path $env:RUNNER_TEMP 'module')) {
             if (Test-Path $dir) { Remove-Item -Recurse -Force $dir -ErrorAction Continue; "removed $dir" }
           }
-          Remove-Item -Force (Join-Path $env:RUNNER_TEMP '*.zip'), (Join-Path $env:RUNNER_TEMP '*.log') -ErrorAction SilentlyContinue
+          Remove-Item -Force (Join-Path $env:RUNNER_TEMP '*.log') -ErrorAction SilentlyContinue

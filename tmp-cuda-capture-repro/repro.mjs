@@ -92,6 +92,49 @@ async function pauseResume(modelId) {
   }
 }
 
+// REPRO_MODE=lora-inference: train one adapter, reload the model with it, then repeat the same
+// prompt with predict: 1 so consecutive prompt-processing graphs are identical and get captured.
+// The prompt is long enough (>100 tokens) for the LoRA matmuls to go through cuBLAS.
+const LORA_PROMPT =
+  'Read the following notes and reply with a single word. ' +
+  'The quarterly report covers revenue, operating costs, hiring plans, the status of three ' +
+  'infrastructure projects, a summary of customer feedback from the last survey, risks related ' +
+  'to supplier delays, and a proposal to consolidate two regional offices into one location. ' +
+  'It also lists open questions for the next planning meeting, including budget approval, the ' +
+  'timeline for the new data platform, and how to measure the impact of the support changes.'
+
+async function loraInference(modelSrc, rounds) {
+  const { scratch, options: opts } = options()
+  try {
+    console.log('=== lora-inference: training an adapter')
+    const handle = finetune({ modelId, options: opts })
+    await drain(handle)
+    console.log(`  -> ${(await handle.result).status}`)
+    await unloadModel({ modelId, clearStorage: false })
+    modelId = undefined
+
+    const adapter = path.join(opts.outputParametersDir, 'trained-lora-adapter.gguf')
+    modelId = await loadModel({
+      modelSrc,
+      modelType: 'llamacpp-completion',
+      modelConfig: { verbosity: 0, ctx_size: 2048, lora: adapter }
+    })
+    const repeats = rounds * 5
+    for (let i = 1; i <= repeats; i++) {
+      const run = completion({
+        modelId,
+        history: [{ role: 'user', content: LORA_PROMPT }],
+        kvCache: false,
+        generationParams: { predict: 1 }
+      })
+      await run.final
+      console.log(`=== lora-inference: prompt ${i}/${repeats} done`)
+    }
+  } finally {
+    rmSync(scratch, { recursive: true, force: true })
+  }
+}
+
 let modelId
 let secondModelId
 let exitCode = 0
@@ -112,17 +155,22 @@ try {
   }
 
   // Same load as the e2e 'finetune-llm' resource.
+  const modelSrc = modelPath === 'registry' ? QWEN3_1_7B_INST_Q4 : path.resolve(modelPath)
   modelId = await loadModel({
-    modelSrc: modelPath === 'registry' ? QWEN3_1_7B_INST_Q4 : path.resolve(modelPath),
+    modelSrc,
     modelType: 'llamacpp-completion',
     modelConfig: { verbosity: 0, ctx_size: 2048 }
   })
 
-  for (let round = 1; round <= rounds; round++) {
-    console.log(`=== round ${round}/${rounds}: finetune-start-complete`)
-    await startComplete(modelId)
-    console.log(`=== round ${round}/${rounds}: finetune-pause-resume`)
-    await pauseResume(modelId)
+  if (process.env.REPRO_MODE === 'lora-inference') {
+    await loraInference(modelSrc, rounds)
+  } else {
+    for (let round = 1; round <= rounds; round++) {
+      console.log(`=== round ${round}/${rounds}: finetune-start-complete`)
+      await startComplete(modelId)
+      console.log(`=== round ${round}/${rounds}: finetune-pause-resume`)
+      await pauseResume(modelId)
+    }
   }
   console.log('=== all rounds completed without a crash')
 } catch (error) {
