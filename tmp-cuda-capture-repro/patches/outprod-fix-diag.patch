@@ -1,0 +1,236 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 9842531..c850484 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2499,6 +2499,109 @@ static bool ggml_cuda_repacked_mmvq_supported(
+     return true;
+ }
+ 
++// TEMP DIAGNOSTIC (debug/cuda-capture-ci, do not merge): which op allocates during CUDA graph
++// capture (graph memory nodes, from cudaMallocAsync) and which op first sees a CUDA error.
++static thread_local const char * ggml_cuda_diag_mm_path = "";
++
++static void ggml_cuda_diag_describe(const char * what, const ggml_tensor * t) {
++    GGML_LOG_ERROR("[diag] %s: %s (%s) type=%s ne=[%lld,%lld,%lld,%lld]%s%s\n", what, t->name, ggml_op_desc(t),
++                   ggml_type_name(t->type), (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2],
++                   (long long) t->ne[3], t->op == GGML_OP_MUL_MAT ? " mm_path=" : "",
++                   t->op == GGML_OP_MUL_MAT ? ggml_cuda_diag_mm_path : "");
++    for (int j = 0; j < 3; j++) {
++        const ggml_tensor * s = t->src[j];
++        if (s != nullptr) {
++            GGML_LOG_ERROR("[diag]     src%d: %s type=%s ne=[%lld,%lld,%lld,%lld]\n", j, s->name, ggml_type_name(s->type),
++                           (long long) s->ne[0], (long long) s->ne[1], (long long) s->ne[2], (long long) s->ne[3]);
++        }
++    }
++}
++
++// Scans the graph being captured for memory nodes added since the last call and attributes them to op.
++struct ggml_cuda_diag_capture_scan {
++    bool                         enabled = false;
++    size_t                       seen    = 0;
++    int                          logged  = 0;
++    int                          alloc_nodes = 0;
++    std::vector<cudaGraphNode_t> nodes;
++
++    void scan(cudaStream_t stream, const ggml_tensor * op) {
++        if (!enabled || op == nullptr) {
++            return;
++        }
++        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
++        cudaGraph_t             graph  = nullptr;
++        size_t                  n      = 0;
++        if (cudaStreamGetCaptureInfo(stream, &status, nullptr, &graph) != cudaSuccess || graph == nullptr ||
++            cudaGraphGetNodes(graph, nullptr, &n) != cudaSuccess) {
++            (void) cudaGetLastError();
++            GGML_LOG_ERROR("[diag] capture scan unavailable, disabled\n");
++            enabled = false;
++            return;
++        }
++        if (n <= seen) {
++            return;
++        }
++        nodes.resize(n);
++        if (cudaGraphGetNodes(graph, nodes.data(), &n) != cudaSuccess) {
++            (void) cudaGetLastError();
++            enabled = false;
++            return;
++        }
++        int allocs = 0;
++        int frees  = 0;
++        for (size_t k = seen; k < n; k++) {
++            cudaGraphNodeType type;
++            if (cudaGraphNodeGetType(nodes[k], &type) != cudaSuccess) {
++                (void) cudaGetLastError();
++                continue;
++            }
++            allocs += type == cudaGraphNodeTypeMemAlloc;
++            frees  += type == cudaGraphNodeTypeMemFree;
++        }
++        seen = n;
++        alloc_nodes += allocs;
++        if ((allocs > 0 || frees > 0) && logged < 40) {
++            logged++;
++            char what[64];
++            snprintf(what, sizeof(what), "op added %d mem-alloc / %d mem-free nodes", allocs, frees);
++            ggml_cuda_diag_describe(what, op);
++        }
++    }
++};
++
++static void ggml_cuda_diag_graph_summary(cudaGraph_t graph) {
++    size_t n = 0;
++    if (cudaGraphGetNodes(graph, nullptr, &n) != cudaSuccess) {
++        (void) cudaGetLastError();
++        return;
++    }
++    std::vector<cudaGraphNode_t> nodes(n);
++    if (cudaGraphGetNodes(graph, nodes.data(), &n) != cudaSuccess) {
++        (void) cudaGetLastError();
++        return;
++    }
++    int kernels = 0, allocs = 0, frees = 0, other = 0;
++    for (cudaGraphNode_t node : nodes) {
++        cudaGraphNodeType type;
++        if (cudaGraphNodeGetType(node, &type) != cudaSuccess) {
++            (void) cudaGetLastError();
++            continue;
++        }
++        if (type == cudaGraphNodeTypeKernel) {
++            kernels++;
++        } else if (type == cudaGraphNodeTypeMemAlloc) {
++            allocs++;
++        } else if (type == cudaGraphNodeTypeMemFree) {
++            frees++;
++        } else {
++            other++;
++        }
++    }
++    GGML_LOG_ERROR("[diag] captured graph: %zu nodes (%d kernels, %d mem-alloc, %d mem-free, %d other)\n", n, kernels,
++                   allocs, frees, other);
++}
++
+ static void ggml_cuda_mul_mat_canonical(
+         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_TENSOR_BINARY_OP_LOCALS
+@@ -2509,6 +2612,7 @@ static void ggml_cuda_mul_mat_canonical(
+     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
+         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
+     if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
++        ggml_cuda_diag_mm_path = "cublas(types/padding)";
+         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+         return;
+     }
+@@ -2519,6 +2623,7 @@ static void ggml_cuda_mul_mat_canonical(
+     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
+         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
+         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
++        ggml_cuda_diag_mm_path = "mmvf";
+         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
+         return;
+     }
+@@ -2533,21 +2638,26 @@ static void ggml_cuda_mul_mat_canonical(
+         dst_vec.nb[1] = dst_vec.nb[0]*ne11;
+         dst_vec.nb[2] = dst_vec.nb[1];
+         dst_vec.nb[3] = dst_vec.nb[1];
++        ggml_cuda_diag_mm_path = "mmvf(transposed)";
+         ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
+         return;
+     }
+     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
++        ggml_cuda_diag_mm_path = "mmf";
+         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
+         return;
+     }
+     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
++        ggml_cuda_diag_mm_path = "mmvq";
+         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+         return;
+     }
+     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
++        ggml_cuda_diag_mm_path = "mmq";
+         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+         return;
+     }
++    ggml_cuda_diag_mm_path = "cublas";
+     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+ }
+ 
+@@ -3186,6 +3296,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context &          ctx,
+     cudaError_t err = cudaGetLastError();
+     if (err != cudaSuccess) {
+         GGML_LOG_ERROR("%s: %s failed\n", __func__, ggml_op_desc(dst));
++        ggml_cuda_diag_describe("failed op", dst);
+         CUDA_CHECK(err);
+     }
+ 
+@@ -5748,8 +5859,27 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context *
+         if (!use_cuda_graph || cuda_graph_update_required) {
+             [[maybe_unused]] int prev_i = 0;
+ 
++            static int ggml_cuda_diag_captures = 0;
++            ggml_cuda_diag_capture_scan diag_scan;
++            diag_scan.enabled = use_cuda_graph && cuda_graph_update_required && ggml_cuda_diag_captures++ < 4;
++            const ggml_tensor * diag_prev = nullptr;
++            bool diag_pending_logged = false;
++            if (diag_scan.enabled) {
++                GGML_LOG_ERROR("[diag] capture #%d starts: %d nodes\n", ggml_cuda_diag_captures, cgraph->n_nodes);
++            }
++
+             for (int i = 0; i < cgraph->n_nodes; i++) {
+                 ggml_tensor * node = cgraph->nodes[i];
++                diag_scan.scan(cuda_ctx->stream(), diag_prev);
++                diag_prev = nullptr;
++                if (use_cuda_graph && cuda_graph_update_required && !diag_pending_logged) {
++                    const cudaError_t pending = cudaPeekAtLastError();
++                    if (pending != cudaSuccess) {
++                        diag_pending_logged = true;
++                        GGML_LOG_ERROR("[diag] CUDA error pending before node %d: %s\n", i, cudaGetErrorString(pending));
++                        ggml_cuda_diag_describe("next node", node);
++                    }
++                }
+                 if (is_concurrent_event_active) {
+                     GGML_ASSERT(concurrent_event);
+ 
+@@ -5791,6 +5921,7 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context *
+                 }
+ 
+                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i, &activation_plan);
++                diag_prev = node;
+ 
+                 if (nodes_to_skip < 0) {
+                     GGML_LOG_ERROR("%s: fusion failed %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+@@ -5837,6 +5968,10 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context *
+                     try_launch_concurrent_event(node);
+                }
+             }
++            diag_scan.scan(cuda_ctx->stream(), diag_prev);
++            if (diag_scan.enabled) {
++                GGML_LOG_ERROR("[diag] capture done: %d mem-alloc nodes recorded\n", diag_scan.alloc_nodes);
++            }
+         }
+ 
+ #ifdef USE_CUDA_GRAPH
+@@ -5848,6 +5983,7 @@ static bool ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context *
+             }
+ 
+             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
++            ggml_cuda_diag_graph_summary(graph->graph);
+             graph_evaluated_or_captured = true; // CUDA graph has been captured
+ 
+             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+diff --git a/ggml/src/ggml-cuda/out-prod.cu b/ggml/src/ggml-cuda/out-prod.cu
+index 8dd49cd..4b6b5ba 100644
+--- a/ggml/src/ggml-cuda/out-prod.cu
++++ b/ggml/src/ggml-cuda/out-prod.cu
+@@ -106,7 +106,10 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const float alpha = 1.0f;
+     const float beta = 0.0f;
+ 
+-    CUBLAS_CHECK(cublasSetStream(handle, stream));
++    // TEMP (debug/cuda-capture-ci): no cublasSetStream here. The handle is already bound to this
++    // stream, and cublasSetStream resets the handle's workspace to cuBLAS's default pool, so every later
++    // cuBLAS call allocates with cudaMallocAsync (graph memory nodes during CUDA graph capture).
++    // Upstream removed this call in d9b6be07d (#26574).
+ 
+     const int64_t lda = allocated_src0 ? ne00 : (nb01 / sizeof(float));
+     const int64_t ldc = nb1  / sizeof(float);

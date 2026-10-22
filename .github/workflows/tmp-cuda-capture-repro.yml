@@ -34,7 +34,10 @@ jobs:
       fail-fast: false
       matrix:
         # rebuilt: no patch (control, must still crash); the others: tmp-cuda-capture-repro/patches/<variant>.patch
-        variant: [rebuilt, diag, fallback, no-train-graphs]
+        # outprod-fix removes out-prod.cu's cublasSetStream, which resets the cuBLAS workspace so cuBLAS
+        # allocates during capture (upstream dropped it in d9b6be07d). Answered earlier: diag, fallback,
+        # no-train-graphs.
+        variant: [rebuilt, outprod-fix, outprod-fix-diag]
     defaults:
       run:
         shell: pwsh
@@ -127,12 +130,79 @@ jobs:
           dumpbin /dependents out\qvac-ggml-cuda.dll | Select-String '\.dll'
           (Get-FileHash out\qvac-ggml-cuda.dll -Algorithm SHA256).Hash
 
+          # The standalone capture test (no ggml), built once.
+          if ('${{ matrix.variant }}' -eq 'rebuilt') {
+            nvcc -O2 -std=c++17 -arch=sm_89 -o out\capture_repro.exe tmp-cuda-capture-repro\capture_repro.cu "-L$cuda\lib\x64" -lcublas -lcuda
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # 7.0.0
         with:
           name: qvac-ggml-cuda-${{ matrix.variant }}
           path: out/qvac-ggml-cuda.dll
           retention-days: 1
           if-no-files-found: error
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # 7.0.0
+        if: matrix.variant == 'rebuilt'
+        with:
+          name: capture-repro
+          path: out/capture_repro.exe
+          retention-days: 1
+          if-no-files-found: error
+
+  # Standalone: do graph memory allocations fail on these machines without ggml? Plus the machine setup.
+  standalone:
+    name: standalone ${{ matrix.leg }}
+    needs: build-module
+    if: ${{ !cancelled() }}
+    runs-on: qvac-win25-x64-gpu
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Two legs, so both machines in the pool are likely covered.
+        leg: [1, 2]
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # 8.0.1
+        with:
+          name: capture-repro
+          path: ${{ runner.temp }}\capture-repro
+
+      - name: Machine setup
+        continue-on-error: true
+        run: |
+          "machine: $env:COMPUTERNAME  runner: $env:RUNNER_NAME"
+          $os = Get-CimInstance Win32_OperatingSystem
+          "OS: $($os.Caption) $($os.Version) build $($os.BuildNumber)"
+          "RAM: {0:N1} GiB total, {1:N1} GiB free" -f ($os.TotalVisibleMemorySize / 1MB), ($os.FreePhysicalMemory / 1MB)
+          "commit limit: {0:N1} GiB, available {1:N1} GiB" -f ($os.TotalVirtualMemorySize / 1MB), ($os.FreeVirtualMemory / 1MB)
+          Get-CimInstance Win32_PageFileUsage | ForEach-Object { "page file: $($_.Name), allocated $($_.AllocatedBaseSize) MiB, in use $($_.CurrentUsage) MiB" }
+          "page file managed automatically: " + (Get-CimInstance Win32_ComputerSystem).AutomaticManagedPagefile
+          $hags = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' -Name HwSchMode -ErrorAction SilentlyContinue).HwSchMode
+          "HwSchMode (hardware GPU scheduling: 2 = on, 1 = off, empty = default): $hags"
+          Get-CimInstance Win32_VideoController | ForEach-Object { "display adapter: $($_.Name), driver $($_.DriverVersion)" }
+          Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -like 'NVIDIA*' } | ForEach-Object { "installed: $($_.DisplayName) $($_.DisplayVersion)" }
+          nvidia-smi --query-gpu=name,driver_version,driver_model.current,driver_model.pending,memory.used,memory.total,compute_mode --format=csv
+          nvidia-smi -q | Select-String -Pattern 'Product Name|Product Brand|Product Architecture|Driver Version|CUDA Version|Virtualization Mode'
+          # Only a count, not the processes: other jobs share this GPU.
+          "GPU compute processes right now: " + @(nvidia-smi --query-compute-apps=pid --format=csv,noheader | Where-Object { $_ }).Count
+          "CUDA_PATH=$env:CUDA_PATH"
+          $global:LASTEXITCODE = 0
+
+      - name: Run the standalone capture test
+        run: |
+          $env:CUDA_LOG_FILE = Join-Path $env:RUNNER_TEMP 'cuda-driver.log'
+          & (Join-Path $env:RUNNER_TEMP 'capture-repro\capture_repro.exe')
+          $code = $LASTEXITCODE
+          if (Test-Path $env:CUDA_LOG_FILE) { '--- CUDA driver error log ---'; Get-Content $env:CUDA_LOG_FILE -TotalCount 60 }
+          else { '--- no CUDA driver error log was written ---' }
+          Remove-Item -Force $env:CUDA_LOG_FILE -ErrorAction SilentlyContinue
+          exit $code
 
   repro:
     name: test ${{ matrix.variant }}
@@ -146,7 +216,7 @@ jobs:
       # At most two jobs on the shared GPU machines at a time.
       max-parallel: 2
       matrix:
-        variant: [rebuilt, diag, fallback, no-train-graphs]
+        variant: [rebuilt, outprod-fix, outprod-fix-diag]
     defaults:
       run:
         shell: powershell
