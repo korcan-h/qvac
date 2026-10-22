@@ -4,10 +4,12 @@
 //
 // Usage: node repro.mjs <path-to-Qwen3-1.7B-Q4_0.gguf | registry> [rounds]
 // `registry` loads the QWEN3_1_7B_INST_Q4 constant CI uses (downloaded into the SDK cache).
+// REPRO_SECOND_MODEL=1 first loads QWEN3_600M_INST_Q4 and runs a short completion, keeping it
+// loaded, so a second CUDA context (with its own 32 GiB VMM pool reservation) exists.
 // Watch the output for "CUDA graph warmup complete": a crash right after it is the CI bug,
 // and a run without that line never captured a graph, so it tested nothing.
 
-import { finetune, loadModel, QWEN3_1_7B_INST_Q4, unloadModel } from '@qvac/sdk'
+import { completion, finetune, loadModel, QWEN3_1_7B_INST_Q4, QWEN3_600M_INST_Q4, unloadModel } from '@qvac/sdk'
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -91,8 +93,24 @@ async function pauseResume(modelId) {
 }
 
 let modelId
+let secondModelId
 let exitCode = 0
 try {
+  if (process.env.REPRO_SECOND_MODEL === '1') {
+    secondModelId = await loadModel({
+      modelSrc: QWEN3_600M_INST_Q4,
+      modelType: 'llamacpp-completion',
+      modelConfig: { verbosity: 0, ctx_size: 2048 }
+    })
+    const run = completion({
+      modelId: secondModelId,
+      history: [{ role: 'user', content: 'Say hello.' }],
+      generationParams: { predict: 16 }
+    })
+    const final = await run.final
+    console.log(`=== second model loaded and ran a completion: ${JSON.stringify(final.contentText ?? '').slice(0, 80)}`)
+  }
+
   // Same load as the e2e 'finetune-llm' resource.
   modelId = await loadModel({
     modelSrc: modelPath === 'registry' ? QWEN3_1_7B_INST_Q4 : path.resolve(modelPath),
@@ -111,8 +129,8 @@ try {
   console.error('FAILED:', error)
   exitCode = 1
 } finally {
-  if (modelId) {
-    await unloadModel({ modelId, clearStorage: false }).catch(() => {})
+  for (const id of [modelId, secondModelId]) {
+    if (id) await unloadModel({ modelId: id, clearStorage: false }).catch(() => {})
   }
 }
 

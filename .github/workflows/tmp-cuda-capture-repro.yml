@@ -27,16 +27,26 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Reproduced the crash in run 2 (about 1 capture per 8-11 tests). Every job also logs the
-          # driver's own error messages (CUDA_LOG_FILE).
-          - name: baseline
+          # Run 3: the crash is cuMemAllocAsync failing during capture (graph memory nodes, ~7 per
+          # layer); under memcheck, where ggml's 32 GiB VMM reservation failed, captures didn't crash.
+          #
+          # Address-space test without the sanitizer: a second model (its own context and 32 GiB
+          # reservation) is loaded first. If the training context's reservation then fails
+          # ("failed to reserve the 32768 MiB VMM pool"), captures should not crash.
+          - name: second-model
             rounds: 20
-          # Names the failing CUDA API call. Side effect: the sanitizer's own address-space use makes
-          # ggml's 32 GiB VMM reservation fail, so this runs on the legacy cudaMalloc pool. A capture
-          # without a crash here would point at the VMM pool.
-          - name: memcheck
-            rounds: 30
-            sanitizer: memcheck
+            second_model: "1"
+          # Which cuBLAS call allocates during capture: cuBLAS / cuBLASLt API logs, tails printed.
+          - name: cublas-log
+            rounds: 20
+            cublas_log: "1"
+          # Run 3 answered these: baseline crashes with cuMemAllocAsync OUT_OF_MEMORY; memcheck
+          # (legacy pool) captured ~7 times without crashing.
+          # - name: baseline
+          #   rounds: 20
+          # - name: memcheck
+          #   rounds: 30
+          #   sanitizer: memcheck
           # Run 2 answered these: graphs-off passes; cuBLAS 13.8.0.4 still crashes.
           # - name: graphs-off
           #   rounds: 8
@@ -125,6 +135,11 @@ jobs:
             ConvertTo-Json | Set-Content -Encoding ascii qvac.config.json
           # Set only when wanted: ggml disables graphs if the variable exists at all.
           if ('${{ matrix.disable_graphs }}' -eq '1') { $env:GGML_CUDA_DISABLE_GRAPHS = '1' }
+          if ('${{ matrix.second_model }}' -eq '1') { $env:REPRO_SECOND_MODEL = '1' }
+          if ('${{ matrix.cublas_log }}' -eq '1') {
+            $env:CUBLAS_LOGINFO_DBG = '1'; $env:CUBLAS_LOGDEST_DBG = Join-Path $env:RUNNER_TEMP 'cublas.log'
+            $env:CUBLASLT_LOG_LEVEL = '5'; $env:CUBLASLT_LOG_FILE = Join-Path $env:RUNNER_TEMP 'cublaslt.log'
+          }
           # The driver writes a plain-English reason for each failed CUDA API call here (R575+ drivers).
           $env:CUDA_LOG_FILE = Join-Path $env:RUNNER_TEMP 'cuda-driver.log'
           $node = (Get-Command node).Source
@@ -141,6 +156,11 @@ jobs:
           } else {
             '--- no CUDA driver error log was written ---'
           }
+          # The calls just before a crash are at the end of the cuBLAS logs.
+          foreach ($log in 'cublas.log', 'cublaslt.log') {
+            $p = Join-Path $env:RUNNER_TEMP $log
+            if (Test-Path $p) { "--- last 200 lines of $log ($((Get-Item $p).Length) bytes) ---"; Get-Content $p -Tail 200 }
+          }
           exit $code
 
       # The runner also empties RUNNER_TEMP after the job; this covers the workspace and makes the
@@ -154,4 +174,4 @@ jobs:
                            (Join-Path $env:RUNNER_TEMP 'cublas'), (Join-Path $env:RUNNER_TEMP 'sanitizer')) {
             if (Test-Path $dir) { Remove-Item -Recurse -Force $dir -ErrorAction Continue; "removed $dir" }
           }
-          Remove-Item -Force (Join-Path $env:RUNNER_TEMP '*.zip') -ErrorAction SilentlyContinue
+          Remove-Item -Force (Join-Path $env:RUNNER_TEMP '*.zip'), (Join-Path $env:RUNNER_TEMP '*.log') -ErrorAction SilentlyContinue
