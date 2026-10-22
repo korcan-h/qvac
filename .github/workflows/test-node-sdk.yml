@@ -104,6 +104,11 @@ on:
         required: false
         type: boolean
         default: true
+      # TEMP (tmp-cuda-win-fix-022): fabric prebuilds artifact from this run to overlay into @qvac/fabric
+      fabric-overlay-artifact:
+        required: false
+        type: string
+        default: ""
     secrets:
       # MQTT_* secrets are typically provided via the release environment
       # (see the `environment: release` job). They are declared required: false
@@ -267,6 +272,40 @@ jobs:
           mqtt-client-cert: ${{ secrets.MQTT_CLIENT_CERT }}
           mqtt-client-key: ${{ secrets.MQTT_CLIENT_KEY }}
 
+      # TEMP (tmp-cuda-win-fix-022): replace the npm @qvac/fabric win32-x64 prebuilds with the ones
+      # built in this run (fabric v11018.2.0 + the out-prod.cu CUDA fix), then show which CUDA module
+      # the tests will load.
+      - name: Download the fixed fabric prebuilds
+        if: inputs.fabric-overlay-artifact != '' && runner.os == 'Windows'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # 8.0.1
+        with:
+          name: ${{ inputs.fabric-overlay-artifact }}
+          path: ${{ runner.temp }}/fabric-prebuilds
+
+      - name: Overlay the fixed fabric into @qvac/fabric
+        if: inputs.fabric-overlay-artifact != '' && runner.os == 'Windows'
+        uses: tetherto/qvac/.github/actions/overlay-local-fabric@10b5b0b0a410a116d81e0f76c4c5027fecda1a64
+        with:
+          workdir: ${{ inputs.working-directory }}
+          prebuilds-root: ${{ runner.temp }}/fabric-prebuilds
+          platform: win32
+          arch: x64
+
+      - name: Show the fabric CUDA module in use
+        if: inputs.fabric-overlay-artifact != '' && runner.os == 'Windows'
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          echo "built in this run:"
+          find "$RUNNER_TEMP/fabric-prebuilds" -name 'qvac-ggml-cuda.dll' -exec sha256sum {} \;
+          echo "installed for the tests:"
+          found=$(find node_modules -path '*@qvac/fabric*' -name 'qvac-ggml-cuda.dll' 2>/dev/null)
+          if [ -z "$found" ]; then
+            echo "::error::no qvac-ggml-cuda.dll under node_modules/@qvac/fabric"
+            exit 1
+          fi
+          echo "$found" | while read -r f; do sha256sum "$f"; done
+
       # The Python client runs from source; the action carries the reason the
       # runner's own Python is used rather than actions/setup-python.
       - name: Set up the Python client
@@ -307,8 +346,10 @@ jobs:
       # The Python leg resolves the same resource table against the same
       # registry, so it bootstraps and caches as `desktop` rather than paying
       # for a second copy of every model.
+      # TEMP (tmp-cuda-win-fix-022): with cache-models off, skip this unfiltered bootstrap (all models);
+      # the test run's own bootstrap downloads just the filtered tests' models.
       - name: Bootstrap (download models)
-        if: steps.models-cache.outputs.cache-hit != 'true'
+        if: inputs.cache-models != false && steps.models-cache.outputs.cache-hit != 'true'
         working-directory: ${{ inputs.working-directory }}
         run: npx qvac-test run:bootstrap:${{ inputs.consumer == 'python' && 'desktop' || inputs.consumer }} --config=.
 
@@ -369,6 +410,17 @@ jobs:
           if (fs.existsSync('consumer.log')) {
             console.log(fs.readFileSync('consumer.log', 'utf8'));
           }
+
+      # TEMP (tmp-cuda-win-fix-022): leave nothing behind on the self-hosted runner: the downloaded
+      # fabric prebuilds in RUNNER_TEMP and the workspace (node_modules with the overlay, and the
+      # SDK cache dir .qvac-cache with the models and the registry store).
+      - name: Clean up the test runner
+        if: always() && inputs.fabric-overlay-artifact != '' && runner.environment != 'github-hosted'
+        shell: bash
+        run: |
+          rm -rf "$RUNNER_TEMP/fabric-prebuilds"
+          rm -rf "$GITHUB_WORKSPACE" && mkdir -p "$GITHUB_WORKSPACE"
+          echo "removed RUNNER_TEMP/fabric-prebuilds and the workspace"
 
   report-finalize:
     name: "[${{ inputs.consumer }}] report-finalize"

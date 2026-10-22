@@ -248,8 +248,10 @@ runs:
         fi
 
     # Only trusted events populate the entry every other run restores.
+    # TEMP (tmp-cuda-win-fix-022): never save, so this branch writes nothing to the repo's Actions cache.
     - name: Save CUDA toolkit
       if: >-
+        false &&
         steps.cache-cuda.outputs.cache-hit != 'true' &&
         (github.event_name == 'push' ||
          github.event_name == 'workflow_dispatch' ||

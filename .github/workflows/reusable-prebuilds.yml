@@ -378,6 +378,17 @@ jobs:
           platform: ${{ matrix.platform }}
           arch: ${{ matrix.arch }}
 
+      # TEMP (tmp-cuda-win-fix-022): read the shared S3 vcpkg binary cache, never write to it.
+      - name: Make the vcpkg binary cache read-only
+        shell: bash
+        run: |
+          sources="${VCPKG_BINARY_SOURCES/,readwrite/,read}"
+          if [[ "$sources" == *readwrite* || "$sources" != *,read* ]]; then
+            echo "::error::unexpected VCPKG_BINARY_SOURCES layout; refusing to run with a writable cache"
+            exit 1
+          fi
+          echo "VCPKG_BINARY_SOURCES=$sources" >> "$GITHUB_ENV"
+
       - name: Cleanup vcpkg
         shell: bash
         run: |
@@ -839,6 +850,7 @@ jobs:
         with:
           name: prebuild-${{ steps.pkg.outputs.name }}-${{ matrix.platform }}-${{ matrix.arch }}${{ matrix.tags }}
           path: ${{ env.WORKDIR }}/prebuilds
+          retention-days: 1 # TEMP (tmp-cuda-win-fix-022)
 
       - name: Run post-artifact validation build
         if: inputs.post-artifact-build-command != ''
@@ -849,6 +861,21 @@ jobs:
           BUILD_ARCH: ${{ matrix.arch }}
           POST_ARTIFACT_BUILD_COMMAND: ${{ inputs.post-artifact-build-command }}
         run: bash -c "$POST_ARTIFACT_BUILD_COMMAND"
+
+      # TEMP (tmp-cuda-win-fix-022): leave nothing behind on a self-hosted build runner: vcpkg
+      # buildtrees/packages (the same wipe "Cleanup vcpkg" does at job start), the CUDA toolkit
+      # setup-cuda assembled in RUNNER_TEMP, and the workspace (sources, downloads, build tree).
+      - name: Clean up the build runner
+        if: always() && runner.environment != 'github-hosted'
+        shell: bash
+        run: |
+          if [ -n "${VCPKG_ROOT:-}" ] && [ -d "$VCPKG_ROOT" ]; then
+            rm -rf "$VCPKG_ROOT"/buildtrees/* "$VCPKG_ROOT"/packages/*
+            echo "removed vcpkg buildtrees/ and packages/ under $VCPKG_ROOT"
+          fi
+          rm -rf "$RUNNER_TEMP/cuda" "$RUNNER_TEMP/fabric-prebuilds"
+          rm -rf "$GITHUB_WORKSPACE" && mkdir -p "$GITHUB_WORKSPACE"
+          echo "removed RUNNER_TEMP/cuda, RUNNER_TEMP/fabric-prebuilds and the workspace"
 
   merge:
     runs-on: ubuntu-latest
@@ -896,6 +923,7 @@ jobs:
         with:
           name: prebuilds-${{ steps.pkg.outputs.name }}
           path: prebuilds
+          retention-days: 1 # TEMP (tmp-cuda-win-fix-022)
       # Tag this run so a later no-native-change push of the same PR can reuse the
       # prebuilds-<pkg> just uploaded. native_hash keeps the marker per-package.
       - name: Save prebuild reuse marker

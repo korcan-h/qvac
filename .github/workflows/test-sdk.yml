@@ -553,11 +553,27 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # TEMP (tmp-cuda-win-fix-022): build @qvac/fabric win32-x64 from packages/fabric, whose overlay port
+  # builds korcan-h/qvac-fabric-llm.cpp at the out-prod.cu CUDA fix; the desktop leg overlays it.
+  fixed-fabric:
+    needs: [resolve]
+    if: needs.resolve.outputs.run-desktop == 'true'
+    permissions:
+      contents: write
+      packages: read
+      pull-requests: write
+      id-token: write
+    uses: ./.github/workflows/prebuilds-fabric.yml
+    with:
+      win32-x64-only: true
+    secrets: inherit
+
   desktop-tests:
-    needs: [resolve, prepare-inference, prepare-test-suite]
+    needs: [resolve, prepare-inference, prepare-test-suite, fixed-fabric]
     if: needs.resolve.outputs.run-desktop == 'true'
     uses: ./.github/workflows/test-node-sdk.yml
     with:
+      fabric-overlay-artifact: prebuilds-fabric # TEMP (tmp-cuda-win-fix-022)
       consumer: desktop
       project-directory: "packages/sdk"
       working-directory: "packages/sdk/e2e"
