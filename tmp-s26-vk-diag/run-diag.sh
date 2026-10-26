@@ -3,6 +3,10 @@
 # Pushes the diagnostic ggml/llama tools to the phone, runs them over adb against the prestaged
 # Qwen3.5 model, and leaves every output in $DEVICEFARM_LOG_DIR/qvac-diag. It never fails the
 # test spec: every step has a device-side timeout, and the whole script keeps to a time budget.
+#
+# Run 2: confirms the two candidate fixes found in run 1, separately and together:
+#   GGML_VK_DISABLE_SUBGROUP_CLUSTERED=1  quantize_q8_1_x4 without subgroupClusteredMax/Add
+#   GGML_VK_NORM_SMALL=0                  no rms_norm_small.comp (short-row RMS norm)
 
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,6 +17,10 @@ BUDGET="${QVAC_DIAG_BUDGET:-2700}"
 T0=$SECONDS
 mkdir -p "$OUT"
 SUMMARY="$OUT/summary.txt"
+
+NOCLUSTERED="GGML_VK_DISABLE_SUBGROUP_CLUSTERED=1"
+NONORMSMALL="GGML_VK_NORM_SMALL=0"
+FIXED="$NOCLUSTERED $NONORMSMALL"
 
 log() { echo "[qvac-diag] $*" | tee -a "$SUMMARY"; }
 
@@ -46,45 +54,46 @@ if ! adb shell test -s "$M"; then
     log "model $M missing on device; model steps will fail"
 fi
 
-# 1. Device summary and the diag line (arch, robustness, coopmat, int dot, fp16, subgroups)
+# 1. Device summary and the diag line, stock and with clustered ops disabled
 run info 120 "./test-backend-ops -b Vulkan0 -o NO_SUCH_OP"
-run info-keep-robustness 120 "GGML_VK_KEEP_ROBUSTNESS=1 ./test-backend-ops -b Vulkan0 -o NO_SUCH_OP"
+run info-noclustered 120 "$NOCLUSTERED ./test-backend-ops -b Vulkan0 -o NO_SUCH_OP"
 
-# 2. Every unique op of the real forward graph (ctx = ubatch = 128, no flash attention, as in the
-#    failing finetune), tested on Vulkan against the CPU
+# 2. The failing finetune (same data, LoRA modules and lr as runFinetuningArchsTest): stock,
+#    CPU reference, each candidate fix alone, and both together
+FT="./llama-finetune-lora -m $M -f $D/train.jsonl --assistant-loss-only -c 128 -b 128 -ub 128 -fa off --lora-modules attn_q,attn_k,attn_v,attn_o --learning-rate 1e-5 --lr-min 1e-8 --num-epochs 1 --checkpoint-save-steps 100000 --checkpoint-save-dir $D/ckpt --output-adapter $D/adapter.gguf -t 6"
+run ft-vk-fixed 600 "$FIXED $FT -dev Vulkan0 -ngl 99"
+run ft-cpu 900 "$FT -dev none -ngl 0"
+run ft-vk 600 "$FT -dev Vulkan0 -ngl 99"
+run ft-vk-noclustered 600 "$NOCLUSTERED $FT -dev Vulkan0 -ngl 99"
+run ft-vk-nonormsmall 600 "$NONORMSMALL $FT -dev Vulkan0 -ngl 99"
+
+# 3. Every unique op of the real forward graph (ctx = ubatch = 128, no flash attention), on Vulkan
+#    vs the CPU, with each candidate fix and both
 run export 300 "./test-export-graph-ops -m $M -c 128 -b 128 -ub 128 -fa off -o $D/qwen35-ops.txt"
 adb pull "$D/qwen35-ops.txt" "$OUT/" >> "$OUT/push.txt" 2>&1
-run tbo-graph 900 "./test-backend-ops -b Vulkan0 --test-file $D/qwen35-ops.txt"
+run tbo-graph-fixed 900 "$FIXED ./test-backend-ops -b Vulkan0 --test-file $D/qwen35-ops.txt"
+run tbo-graph-noclustered 900 "$NOCLUSTERED ./test-backend-ops -b Vulkan0 --test-file $D/qwen35-ops.txt"
+run tbo-graph-nonormsmall 900 "$NONORMSMALL ./test-backend-ops -b Vulkan0 --test-file $D/qwen35-ops.txt"
 
-# 3. Per-tensor dump of the real model forward on CPU and Vulkan: diff the sums offline to find
-#    the first node that diverges
-EVAL="./llama-eval-callback -m $M -f $D/prompt.txt -c 256 -b 128 -ub 128 -fa off --no-warmup -t 6"
+# 4. Op suites with the fixes: quantized MUL_MAT without clustered ops, the other ops this model
+#    uses (now including the gated-delta-net backward op) without rms_norm_small
+run tbo-mul-mat-noclustered 1200 "$NOCLUSTERED ./test-backend-ops -b Vulkan0 -o MUL_MAT -p \"type_a=(f32|f16|q4_0|q4_1|q8_0|q5_K|q6_K),\""
+run tbo-other-ops-fixed 1200 "$FIXED ./test-backend-ops -b Vulkan0 -o GATED_DELTA_NET,GATED_DELTA_NET_BACK,SSM_CONV,L2_NORM,RMS_NORM,NORM,ROPE,SOFT_MAX,SWIGLU,SILU,SIGMOID,SOFTPLUS,EXP,NEG,GET_ROWS,SET_ROWS,CPY,CONT,CONCAT,ADD,MUL,SCALE,SUM_ROWS,ACC"
+run tbo-gdn 600 "./test-backend-ops -b Vulkan0 -o GATED_DELTA_NET,GATED_DELTA_NET_BACK"
+
+# 5. Per-tensor dump of the real model forward on CPU, stock Vulkan and fixed Vulkan
+EVAL="./llama-eval-callback -m $M -f $D/prompt.txt -c 256 -b 128 -ub 128 -fa off -t 6"
 run evalcb-cpu 600 "$EVAL -dev none -ngl 0"
 run evalcb-vk 600 "$EVAL -dev Vulkan0 -ngl 99"
+run evalcb-vk-fixed 600 "$FIXED $EVAL -dev Vulkan0 -ngl 99"
 
-# 4. The failing finetune itself (same data, LoRA modules and lr as runFinetuningArchsTest):
-#    step losses on CPU, on Vulkan, and on Vulkan with each candidate switch
-FT="./llama-finetune-lora -m $M -f $D/train.jsonl --assistant-loss-only -c 128 -b 128 -ub 128 -fa off --lora-modules attn_q,attn_k,attn_v,attn_o --learning-rate 1e-5 --lr-min 1e-8 --num-epochs 1 --checkpoint-save-steps 100000 --checkpoint-save-dir $D/ckpt --output-adapter $D/adapter.gguf -t 6"
-run ft-vk 600 "$FT -dev Vulkan0 -ngl 99"
-run ft-cpu 900 "$FT -dev none -ngl 0"
-run ft-vk-keep-robustness 600 "GGML_VK_KEEP_ROBUSTNESS=1 $FT -dev Vulkan0 -ngl 99"
-for v in DISABLE_INTEGER_DOT_PRODUCT DISABLE_F16 DISABLE_FUSION DISABLE_COOPMAT DISABLE_MMVQ DISABLE_GRAPH_OPTIMIZE PREFER_HOST_MEMORY; do
-    run "ft-vk-$v" 600 "GGML_VK_$v=1 $FT -dev Vulkan0 -ngl 99"
-done
-run ft-vk-serialized 900 "GGML_VK_SERIALIZE_SUBMISSIONS=1 GGML_VK_MAX_NODES_PER_SUBMIT=1 $FT -dev Vulkan0 -ngl 99"
-
-# 5. Robustness variants of the op-level checks
-run tbo-graph-keep-robustness 900 "GGML_VK_KEEP_ROBUSTNESS=1 ./test-backend-ops -b Vulkan0 --test-file $D/qwen35-ops.txt"
-run evalcb-vk-keep-robustness 600 "GGML_VK_KEEP_ROBUSTNESS=1 $EVAL -dev Vulkan0 -ngl 99"
-
-# 6. The standard test suites of the ops this model uses, as far as the budget allows
-run tbo-mul-mat 1200 "./test-backend-ops -b Vulkan0 -o MUL_MAT -p \"type_a=(f32|f16|q4_0|q4_1|q8_0|q5_K|q6_K),\""
-run tbo-other-ops 1200 "./test-backend-ops -b Vulkan0 -o GATED_DELTA_NET,SSM_CONV,L2_NORM,RMS_NORM,NORM,ROPE,SOFT_MAX,SWIGLU,SILU,SIGMOID,SOFTPLUS,EXP,NEG,GET_ROWS,SET_ROWS,CPY,CONT,CONCAT,ADD,MUL,SCALE,SUM_ROWS,ACC"
+# 6. The separate non-integer-dot bug (wrong on both Adrenos in run 1): which MUL_MAT cases fail
+run tbo-mul-mat-noid 1200 "GGML_VK_DISABLE_INTEGER_DOT_PRODUCT=1 ./test-backend-ops -b Vulkan0 -o MUL_MAT -p \"type_a=(f32|f16|q4_0|q4_1|q8_0|q5_K|q6_K),\""
 
 # Short results in the host log too (Test_spec_output), in case the artifact folder is dropped
 {
     echo "--- device summary"
-    grep -ah "ggml_vulkan: [0-9] = \|ggml_vulkan: diag:" "$OUT"/info*.txt
+    grep -ah "ggml_vulkan: [0-9] = \|ggml_vulkan: diag:" "$OUT"/info.txt "$OUT"/info-noclustered.txt
     echo "--- test-backend-ops failures (first 40 per run)"
     for f in "$OUT"/tbo-*.txt; do
         echo "## $(basename "$f"): $(grep -ac 'FAIL' "$f") FAIL lines, $(grep -a 'tests passed' "$f" | tail -1)"
