@@ -233,6 +233,11 @@ runs:
                   echo "  Extracted iOS crash report: ${device}_crash_$(basename "$crash")"
                 done
               done
+              # TEMP (debug/s26-vk-diag): outputs of tmp-s26-vk-diag/run-diag.sh
+              find "$tmpdir" -type d -name "qvac-diag" 2>/dev/null | while read -r ddir; do
+                cp -r "$ddir" "$CONSOLE_DIR/${device}_qvac-diag"
+                echo "  Extracted: ${device}_qvac-diag/"
+              done
             fi
             rm -rf "$tmpdir"
           fi

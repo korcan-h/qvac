@@ -1,0 +1,41 @@
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index f1e165d79..ec7ae99fd 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -5362,6 +5362,10 @@ vk_device ggml_vk_get_device(size_t idx) {
+                           !getenv("GGML_VK_DISABLE_OCP_FP4");
+ 
+         device->pipeline_robustness = pl_robustness_features.pipelineRobustness;
++        // DIAG: keep driver robustness on every pipeline (disable_robustness becomes a no-op)
++        if (getenv("GGML_VK_KEEP_ROBUSTNESS") != nullptr) {
++            device->pipeline_robustness = false;
++        }
+ 
+         device->multi_add = vk12_props.shaderRoundingModeRTEFloat16 &&
+                             device->properties.limits.maxPushConstantsSize >= sizeof(vk_op_multi_add_push_constants) &&
+@@ -5868,6 +5872,16 @@ vk_device ggml_vk_get_device(size_t idx) {
+         descriptor_set_layout_create_info.setPNext(&dslbfci);
+         device->dsl = device->device.createDescriptorSetLayout(descriptor_set_layout_create_info);
+ 
++        // DIAG: the decisions that select shader variants, after every env override
++        GGML_LOG_INFO("ggml_vulkan: diag: %s arch=%d robustness_ext_disabling=%d coopmat=%d (m%u n%u k%u acc16=%d acc32=%d) coopmat_f32=%d coopmat_int=%d "
++                      "int_dot=%d fp16=%d bf16=%d subgroup=%u sg_ctrl=%d sg_arith=%d sg_shuffle=%d fusion=%d\n",
++                      device->name.c_str(), (int) device->architecture, device->pipeline_robustness,
++                      device->coopmat_support, device->coopmat_m, device->coopmat_n, device->coopmat_k,
++                      device->coopmat_acc_f16_support, device->coopmat_acc_f32_support, device->coopmat_f32_support,
++                      device->coopmat_int_support, device->integer_dot_product, device->fp16, device->bf16,
++                      device->subgroup_size, device->subgroup_size_control, device->subgroup_arithmetic,
++                      device->subgroup_shuffle, !device->disable_fusion);
++
+         ggml_vk_load_shaders_big_stack(device);
+ 
+         // Prefer a dedicated transfer queue on AMD dGPUs (non-GCN) when graphics queue use is disabled.
+@@ -6161,7 +6175,7 @@ static void ggml_vk_print_gpu_info(size_t idx) {
+ #endif
+ 
+     std::string device_name = props2.properties.deviceName.data();
+-    GGML_LOG_DEBUG("ggml_vulkan: %zu = %s (%s) | uma: %d | fp16: %s | bf16: %d | fp4: %d | warp size: %zu | shared memory: %d | int dot: %d | matrix cores: %s\n",
++    GGML_LOG_INFO("ggml_vulkan: %zu = %s (%s) | uma: %d | fp16: %s | bf16: %d | fp4: %d | warp size: %zu | shared memory: %d | int dot: %d | matrix cores: %s\n",
+               idx, device_name.c_str(), driver_props.driverName.data(), uma, fp16_str, bf16, fp4, subgroup_size,
+               props2.properties.limits.maxComputeSharedMemorySize, integer_dot_product, matrix_cores.c_str());
+ 
